@@ -8955,7 +8955,7 @@ function demarrer(){
 }
 if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', demarrer); else demarrer();
 
-window.OviPush = {ouvrir:ouvrir, etat:etat, construireRappels:construireRappels, synchroniser:planifierSynchro};
+window.OviPush = {serveur:serveur, ouvrir:ouvrir, etat:etat, construireRappels:construireRappels, synchroniser:planifierSynchro, actif:actif, desactiverSilencieux:function(){ if(!actif()) return Promise.resolve(); var m=window.toast; window.toast=function(){}; return desactiver().then(function(){ window.toast=m; }, function(){ window.toast=m; }); }};
 })();
 
 </script>
@@ -9070,6 +9070,473 @@ document.head.appendChild(st);
 
 if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', demarrer); else demarrer();
 window.OviMaj = {verifier:verifier};
+})();
+
+</script>
+<!-- ===== COMPTES, FERMES PARTAGÉES, SYNCHRONISATION ===== -->
+<script>
+/* =====================================================================
+   OviAssist : comptes, fermes partagées, synchronisation
+   ---------------------------------------------------------------------
+   - Chaque éleveur a son compte (email + mot de passe) et sa ferme.
+   - Une ferme peut être partagée (associé, salarié, vétérinaire) avec un
+     code d'invitation ; personne d'autre n'y a accès.
+   - Les données restent sur l'appareil (l'app marche sans réseau) et sont
+     synchronisées avec le compte dès qu'il y a du réseau : téléphone,
+     tablette et ordinateur retrouvent les mêmes informations.
+   - Se déconnecter efface les données de l'appareil (elles restent sur le
+     compte) : un téléphone prêté ne garde rien.
+   - Mode « sans compte » : comme avant, tout reste sur cet appareil.
+   ===================================================================== */
+(function(){
+'use strict';
+var K_COMPTE='ovi_compte', K_LOCAL='ovi_mode_local';
+var CLES_DONNEES=['ovi_lots','ovi_rappels','ovi_vaccins','ovi_actes_eco','ovi_stocks','ovi_stocks_uses','ovi_lots_archives','ovi_prix','ovi_meteo_lieu','ovi_current_lot'];
+var SURVEILLEES=new Set(CLES_DONNEES.filter(function(k){ return k!=='ovi_current_lot'; }));
+var TOURS_MDP=150000;
+
+function $(id){ return document.getElementById(id); }
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+function lire(k,d){ try{ var v=localStorage.getItem(k); return v==null?d:JSON.parse(v); }catch(e){ return d; } }
+var _setItem = Storage.prototype.setItem;
+function ecrireBrut(k,v){ try{ _setItem.call(localStorage, k, typeof v==='string'?v:JSON.stringify(v)); }catch(e){} }
+function T(m){ try{ toast(m, 3600); }catch(e){} }
+function serveur(){
+  try{ if(window.OviPush && OviPush.serveur) return OviPush.serveur(); }catch(e){}
+  return String(localStorage.getItem('ovi_push_serveur')||'https://oviassist-notifs.julien-legraet5322.workers.dev').replace(/\/+$/,'');
+}
+var compte = lire(K_COMPTE, null);   // {token, user, fermes, fermeId, fermeNom, role, expire?}
+function sauverCompte(){ if(compte) ecrireBrut(K_COMPTE, compte); else localStorage.removeItem(K_COMPTE); }
+// Les comptes ne marchent que depuis le site officiel (le serveur refuse les autres adresses) :
+// ailleurs (fichier ouvert directement, aperçu), l'app reste en mode « sans compte » sans rien bloquer.
+var SITES_COMPTES = ['julienlegraet5322-hue.github.io', 'localhost', '127.0.0.1'];
+function siteCompte(){ return /^https?:$/.test(location.protocol) && SITES_COMPTES.indexOf(location.hostname)>=0; }
+function modeLocal(){ return localStorage.getItem(K_LOCAL)==='1' || !siteCompte(); }
+function connecte(){ return !!(compte && compte.token && compte.fermeId); }
+
+// ---------------------------------------------------------------------
+// Appels au serveur
+// ---------------------------------------------------------------------
+function api(chemin, corps, sansJeton){
+  var h={'Content-Type':'application/json'};
+  if(!sansJeton && compte && compte.token) h.Authorization='Bearer '+compte.token;
+  return fetch(serveur()+chemin, {method:'POST', headers:h, body:JSON.stringify(corps||{})}).then(function(r){
+    return r.json().catch(function(){ return {}; }).then(function(j){
+      if(!r.ok){ var e=new Error(j.erreur||('erreur '+r.status)); e.status=r.status; throw e; }
+      return j;
+    });
+  }, function(){ var e=new Error('pas de connexion au serveur'); e.reseau=true; throw e; });
+}
+// Le mot de passe est étiré sur l'appareil : le serveur ne le voit jamais
+async function cleMdp(email, mdp){
+  var k=await crypto.subtle.importKey('raw', new TextEncoder().encode(mdp), 'PBKDF2', false, ['deriveBits']);
+  var b=await crypto.subtle.deriveBits({name:'PBKDF2', hash:'SHA-256', salt:new TextEncoder().encode('oviassist:'+email.trim().toLowerCase()), iterations:TOURS_MDP}, k, 256);
+  return Array.from(new Uint8Array(b)).map(function(x){ return x.toString(16).padStart(2,'0'); }).join('');
+}
+
+// ---------------------------------------------------------------------
+// Collections synchronisées
+// ---------------------------------------------------------------------
+function tableau(nom){ try{ return (0,eval)(nom); }catch(e){ return null; } }
+function remplacer(arr, nouv){ if(Array.isArray(arr)){ arr.splice.apply(arr, [0, arr.length].concat(nouv)); } }
+var COLS = {
+  lots:       {cle:'ovi_lots',        get:function(){ return tableau('lots'); },        save:function(){ saveLots(); }},
+  rappels:    {cle:'ovi_rappels',     get:function(){ return tableau('rappels'); },     save:function(){ saveRappels(); }},
+  vaccins:    {cle:'ovi_vaccins',     get:function(){ return tableau('vaccins'); },     save:function(){ saveVaccins(); }},
+  actesEco:   {cle:'ovi_actes_eco',   get:function(){ return tableau('actesEco'); },    save:function(){ saveActesEco(); }},
+  stocks:     {cle:'ovi_stocks',      get:function(){ return tableau('stocks'); },      save:function(){ saveStocks(); }},
+  stocksUses: {cle:'ovi_stocks_uses', get:function(){ return tableau('stocksUses'); },  save:function(){ saveStocksUses(); }},
+  archives:   {cle:'ovi_lots_archives', get:function(){ return window.OviAvance ? OviAvance.archives() : lire('ovi_lots_archives',[]); },
+               save:function(){ ecrireBrut('ovi_lots_archives', COLS.archives.get()); }},
+  reglages:   {cle:null,
+               get:function(){ var p=window.OviAvance?OviAvance.prix():lire('ovi_prix',{}); var out=[{id:'prix', v:p}]; var m=lire('ovi_meteo_lieu',null); if(m) out.push({id:'meteo', v:m}); return out; },
+               appliquer:function(id, data){
+                 if(id==='prix'){ var p=window.OviAvance?OviAvance.prix():null; var v=(data&&data.v)||{};
+                   if(p){ Object.keys(p).forEach(function(k){ delete p[k]; }); Object.assign(p, v); if(!p.produits) p.produits={}; }
+                   ecrireBrut('ovi_prix', v); }
+                 if(id==='meteo'){ if(data&&data.v) ecrireBrut('ovi_meteo_lieu', data.v); else localStorage.removeItem('ovi_meteo_lieu'); }
+               },
+               save:function(){}}
+};
+function hash(s){ var h=2166136261; for(var i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=Math.imul(h,16777619); } return (h>>>0).toString(36)+'.'+s.length; }
+function cleSync(){ return 'ovi_sync_'+compte.fermeId; }
+function etatSync(){ return lire(cleSync(), {seq:0, recs:{}}); }
+function sauverEtat(e){ ecrireBrut(cleSync(), e); }
+
+// Ce qui a changé sur cet appareil depuis la dernière synchro
+function changementsLocaux(etat){
+  var out=[], vus={}, now=Date.now();
+  Object.keys(COLS).forEach(function(col){
+    var arr=COLS[col].get()||[];
+    arr.forEach(function(r){
+      if(!r || typeof r!=='object') return;
+      if(r.id==null){ r.id=col+'_'+now.toString(36)+Math.random().toString(36).slice(2,6); }
+      var k=col+':'+r.id, h=hash(JSON.stringify(r)); vus[k]=true;
+      var s=etat.recs[k];
+      if(!s || s.h!==h) out.push({col:col, id:String(r.id), data:r, maj:now, base:s?s.maj:0, _h:h});
+    });
+  });
+  Object.keys(etat.recs).forEach(function(k){
+    if(vus[k]) return;
+    var i=k.indexOf(':'), col=k.slice(0,i), id=k.slice(i+1);
+    if(COLS[col]) out.push({col:col, id:id, suppr:true, maj:now, base:etat.recs[k].maj, _h:null});
+  });
+  return out;
+}
+
+// Applique ce qui vient du serveur, sans écraser une saisie faite pendant l'envoi
+var enApplication=false;
+function appliquerDistant(etat, changes, envoyes){
+  var modifCols={}, venusDAilleurs=0;
+  changes.forEach(function(c){
+    var col=COLS[c.col]; if(!col) return;
+    var k=c.col+':'+c.id;
+    var attendu = envoyes[k]!==undefined ? envoyes[k] : (etat.recs[k] ? etat.recs[k].h : null);
+    var arr = col.get()||[];
+    var idx = c.col==='reglages' ? -1 : arr.findIndex(function(r){ return r && String(r.id)===c.id; });
+    var local = c.col==='reglages' ? (col.get().filter(function(x){ return x.id===c.id; })[0]||null) : (idx>=0?arr[idx]:null);
+    var hLocal = local ? hash(JSON.stringify(local)) : null;
+    if(hLocal!==attendu){ if(etat.recs[k]) etat.recs[k].maj=c.maj; else etat.recs[k]={h:'~', maj:c.maj}; return; }   // modifié entre-temps : renvoyé au prochain tour
+    if(c.suppr){
+      if(c.col==='reglages') col.appliquer(c.id, null); else if(idx>=0) arr.splice(idx,1);
+      delete etat.recs[k];
+    } else {
+      var hD=hash(JSON.stringify(c.data));
+      if(hD!==hLocal){
+        if(c.col==='reglages') col.appliquer(c.id, c.data); else if(idx>=0) arr[idx]=c.data; else arr.push(c.data);
+        if(envoyes[k]===undefined || envoyes[k]!==hD) venusDAilleurs++;
+      }
+      etat.recs[k]={h:hD, maj:c.maj};
+    }
+    modifCols[c.col]=true;
+  });
+  enApplication=true;
+  try{ Object.keys(modifCols).forEach(function(col){ try{ COLS[col].save(); }catch(e){} }); } finally { enApplication=false; }
+  return {cols:Object.keys(modifCols), autres:venusDAilleurs};
+}
+
+var syncEnCours=null, relance=false, minuteur=null, dernierStatut={etat:'', quand:null, erreur:null, attente:0};
+function planifier(delai){ if(!connecte()) return; clearTimeout(minuteur); minuteur=setTimeout(synchroniser, delai==null?1500:delai); }
+async function synchroniser(){
+  if(!connecte()) return;
+  if(syncEnCours){ relance=true; return syncEnCours; }
+  syncEnCours=(async function(){
+    var etat=etatSync(), autres=0, cols={};
+    var ch=changementsLocaux(etat);
+    dernierStatut.attente=ch.length;
+    if(navigator.onLine===false){ dernierStatut.etat='hors-ligne'; majStatut(); return; }
+    dernierStatut.etat='envoi'; majStatut();
+    try{
+      var envoyes={}; ch.forEach(function(c){ envoyes[c.col+':'+c.id]=c._h; });
+      var tour=0, depuis=etat.seq, encore=true, aEnvoyer=ch.map(function(c){ return {col:c.col,id:c.id,data:c.data,maj:c.maj,base:c.base,suppr:c.suppr}; });
+      while(encore && tour<20){
+        var r=await api('/sync', {fermeId:compte.fermeId, depuis:depuis, changes:tour===0?aEnvoyer:[]});
+        var res=appliquerDistant(etat, r.changes||[], envoyes);
+        autres+=res.autres; res.cols.forEach(function(c){ cols[c]=true; });
+        etat.seq=r.seq; depuis=r.seq; encore=!!r.encore; tour++;
+      }
+      sauverEtat(etat);
+      dernierStatut={etat:'ok', quand:new Date(), erreur:null, attente:changementsLocaux(etatSync()).length};
+      if(autres) rafraichir(Object.keys(cols), autres);
+    }catch(e){
+      dernierStatut.etat='erreur'; dernierStatut.erreur=e.message; dernierStatut.quand=new Date();
+      if(e.status===401){ compte.expire=true; sauverCompte(); bandeauExpire(); }
+      if(e.status===403){ dernierStatut.erreur='vous n\'avez plus accès à cette ferme'; }
+    }
+    majStatut();
+  })().finally(function(){ syncEnCours=null; if(relance){ relance=false; planifier(300); } });
+  return syncEnCours;
+}
+
+// Toute écriture des données dans le stockage déclenche une synchro
+Storage.prototype.setItem=function(k,v){
+  _setItem.apply(this, arguments);
+  if(this===window.localStorage && SURVEILLEES.has(k) && !enApplication) planifier();
+};
+
+function rafraichir(cols, n){
+  var p=document.querySelector('.page.active'); var id=p?p.id:'';
+  try{
+    if(id==='pageLots') renderLots();
+    else if(id==='pageRappels') renderRappels();
+    else if(id==='pageVaccins') renderVaccinsPage();
+    else if(id==='pageMemoire' && window.OviAvance) OviAvance.renderMemoire();
+    else if(id==='pageHome') showPage('home');
+    updateRappelBadge();
+  }catch(e){}
+  T('↻ '+n+' mise(s) à jour reçue(s) d\'un autre appareil');
+}
+
+// ---------------------------------------------------------------------
+// Données locales : présence, effacement
+// ---------------------------------------------------------------------
+function resumeLocal(){
+  var l=lire('ovi_lots',[]), r=lire('ovi_rappels',[]), v=lire('ovi_vaccins',[]);
+  return {lots:l.length, autres:r.length+v.length+lire('ovi_actes_eco',[]).length+lire('ovi_stocks',[]).length, total:l.length+r.length+v.length};
+}
+function effacerLocal(){
+  CLES_DONNEES.forEach(function(k){ localStorage.removeItem(k); });
+  Object.keys(localStorage).filter(function(k){ return k.indexOf('ovi_sync_')===0; }).forEach(function(k){ localStorage.removeItem(k); });
+}
+
+// ---------------------------------------------------------------------
+// Écran de connexion
+// ---------------------------------------------------------------------
+var CSS = '.cg{position:fixed;inset:0;z-index:2000;background:var(--surface,#F4F6F3);overflow-y:auto;display:flex;justify-content:center;padding:max(24px,env(safe-area-inset-top)) 16px 32px}'+
+'.cg-box{width:100%;max-width:420px;margin:auto 0}.cg-logo{display:flex;align-items:center;gap:12px;margin-bottom:18px}.cg-logo .ic{width:48px;height:48px;border-radius:12px;background:var(--g-deep,#173F30);color:#fff;display:flex;align-items:center;justify-content:center}'+
+'.cg-logo .ic svg{width:30px;height:30px;stroke:#fff}.cg h1{font-family:var(--font-d);font-size:1.5rem;color:var(--g-deep);line-height:1.1}.cg-sub{font-size:.875rem;color:var(--text-soft)}'+
+'.cg-card{background:var(--white,#fff);border:1px solid var(--border-light);border-radius:var(--r,12px);padding:18px;box-shadow:var(--shadow)}'+
+'.cg-tabs{display:flex;gap:2px;padding:3px;background:var(--surface2);border-radius:10px;margin-bottom:16px}.cg-tabs button{flex:1;min-height:40px;border:none;background:none;border-radius:8px;font:500 .875rem var(--font-b);color:var(--text-soft);cursor:pointer}'+
+'.cg-tabs button.on{background:var(--white);color:var(--g-deep);box-shadow:var(--shadow)}.cg .btn{width:100%;margin-top:6px}.cg-err{color:#8A1A12;font-size:.8125rem;margin:6px 0 0;min-height:1em}'+
+'.cg-lien{background:none;border:none;color:var(--g-mid);font:500 .875rem var(--font-b);cursor:pointer;padding:10px 0;text-decoration:underline}'+
+'.cg-note{font-size:.8125rem;color:var(--text-muted);line-height:1.5;margin-top:14px}.cg-code{font:700 1.5rem/1.3 ui-monospace,Menlo,Consolas,monospace;letter-spacing:.08em;text-align:center;padding:16px;border:2px dashed var(--straw,#E2C064);border-radius:10px;background:var(--straw-pale,#F8EFD2);color:#3F2E02;margin:12px 0;user-select:all}'+
+'.cg-choix{display:grid;gap:10px}.cg-choix button{text-align:left;padding:14px;border:1px solid var(--border);border-radius:10px;background:var(--white);cursor:pointer;font:inherit}.cg-choix button b{display:block;color:var(--g-deep)}.cg-choix button span{font-size:.8125rem;color:var(--text-soft)}'+
+'.cg-choix button:hover,.cg-choix button:focus-visible{border-color:var(--g-mid);background:var(--g-xpale)}.cg-local{margin-top:18px;text-align:center}'+
+'.cg-oeil{position:relative}.cg-oeil button{position:absolute;right:6px;top:50%;transform:translateY(-50%);border:none;background:none;color:var(--text-muted);font-size:.75rem;cursor:pointer;padding:8px}'+
+'.cmpt-ferme{padding:12px 14px;border:1px solid var(--border-light);border-radius:10px;margin-bottom:10px}.cmpt-ferme b{color:var(--g-deep)}.cmpt-sec{margin-top:18px}.cmpt-sec h4{font-size:.8125rem;text-transform:uppercase;letter-spacing:.04em;color:var(--text-muted);margin-bottom:8px}'+
+'.cmpt-row{display:flex;justify-content:space-between;gap:10px;align-items:center;padding:8px 0;border-top:1px solid var(--border-light);font-size:.875rem}.cmpt-row:first-of-type{border-top:none}'+
+'.cmpt-st{display:flex;gap:8px;align-items:center;font-size:.8125rem;color:var(--text-soft)}.cmpt-st i{width:8px;height:8px;border-radius:50%;background:var(--g-light)}.cmpt-st.attente i{background:var(--amber)}.cmpt-st.erreur i{background:var(--red)}'+
+'.cmpt-bandeau{position:fixed;top:calc(var(--header-h,56px) + var(--safe-top,0px) + 8px);left:12px;right:12px;z-index:950;max-width:520px;margin:0 auto;background:var(--amber-pale);border:1px solid #F0CF9F;color:#5A3002;border-radius:10px;padding:10px 12px;display:flex;gap:10px;align-items:center;font-size:.875rem}'+
+'.cmpt-bandeau button{margin-left:auto}#navCompte .cmpt-dot{position:absolute;top:8px;right:22px;width:8px;height:8px;border-radius:50%;background:var(--amber);display:none}#navCompte{position:relative}';
+
+var ICO_MOUTON='<svg viewBox="0 0 24 24" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M14.6 7.9a2.7 2.7 0 0 0-4.2-.8 2.7 2.7 0 0 0-4.6 1.6 2.4 2.4 0 0 0-1.8 3.9 2.4 2.4 0 0 0 2 3.9 2.5 2.5 0 0 0 4 .3 2.5 2.5 0 0 0 4.2-1.1"/><rect x="14.2" y="7.4" width="6.2" height="8" rx="3.1"/><path d="M14.5 9.4 12.9 10M20.1 9.4 21.7 10"/><path d="M7.6 17.4v2.6M12 17.4v2.6"/></svg>';
+var gate=null, onglet='connexion', emailPre='';
+function champMdp(id, lbl, auto){ return '<div class="form-group"><label class="form-label" for="'+id+'">'+lbl+'</label><div class="cg-oeil"><input class="form-input" type="password" id="'+id+'" autocomplete="'+auto+'" minlength="8"><button type="button" data-voir="'+id+'">Afficher</button></div></div>'; }
+function ouvrirGate(mode){
+  onglet = mode || onglet;
+  if(!gate){ gate=document.createElement('div'); gate.className='cg'; gate.id='compteGate'; gate.setAttribute('role','dialog'); gate.setAttribute('aria-modal','true'); gate.setAttribute('aria-labelledby','cgTitre'); document.body.appendChild(gate); gate.addEventListener('click', clicGate); gate.addEventListener('submit', function(e){ e.preventDefault(); var b=e.target.querySelector('[data-act]'); if(b) agir(b.getAttribute('data-act'), b); }); }
+  document.documentElement.style.overflow='hidden';
+  rendreGate();
+}
+function fermerGate(){ if(gate){ gate.remove(); gate=null; } document.documentElement.style.overflow=''; }
+function rendreGate(contenu){
+  var h='<div class="cg-box"><div class="cg-logo"><div class="ic">'+ICO_MOUTON+'</div><div><h1 id="cgTitre">OviAssist</h1><div class="cg-sub">Aide à la décision · parasitisme ovin</div></div></div><div class="cg-card">';
+  if(contenu){ h+=contenu; }
+  else {
+    h+='<div class="cg-tabs" role="tablist"><button type="button" role="tab" data-tab="connexion" class="'+(onglet==='connexion'?'on':'')+'">Se connecter</button><button type="button" role="tab" data-tab="creer" class="'+(onglet==='creer'?'on':'')+'">Créer un compte</button></div>';
+    if(onglet==='connexion') h+='<form novalidate><div class="form-group"><label class="form-label" for="cgEmail">Email</label><input class="form-input" type="email" id="cgEmail" autocomplete="username" inputmode="email" value="'+esc(emailPre)+'"></div>'+champMdp('cgMdp','Mot de passe','current-password')+
+      '<p class="cg-err" id="cgErr" role="alert"></p><button class="btn btn-primary" type="submit" data-act="connexion">Se connecter</button></form><button class="cg-lien" type="button" data-tab="recup">Mot de passe oublié ?</button>';
+    else if(onglet==='creer') h+='<form novalidate><div class="form-group"><label class="form-label" for="cgEmail">Email</label><input class="form-input" type="email" id="cgEmail" autocomplete="username" inputmode="email" value="'+esc(emailPre)+'"></div>'+champMdp('cgMdp','Mot de passe (8 caractères minimum)','new-password')+champMdp('cgMdp2','Confirmer le mot de passe','new-password')+
+      '<p class="cg-err" id="cgErr" role="alert"></p><button class="btn btn-primary" type="submit" data-act="creer">Créer mon compte</button></form><p class="cg-note">Vos données d\'élevage ne sont visibles que par vous et les personnes que vous invitez sur votre ferme.</p>';
+    else if(onglet==='recup') h+='<form novalidate><p class="cg-sub" style="margin-bottom:12px">Entrez le code de récupération reçu à la création du compte (format ABCD-EFGH-JKLM).</p><div class="form-group"><label class="form-label" for="cgEmail">Email</label><input class="form-input" type="email" id="cgEmail" autocomplete="username" value="'+esc(emailPre)+'"></div>'+
+      '<div class="form-group"><label class="form-label" for="cgRecup">Code de récupération</label><input class="form-input" id="cgRecup" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false"></div>'+champMdp('cgMdp','Nouveau mot de passe','new-password')+
+      '<p class="cg-err" id="cgErr" role="alert"></p><button class="btn btn-primary" type="submit" data-act="recup">Changer le mot de passe</button></form><button class="cg-lien" type="button" data-tab="connexion">← Retour</button>';
+  }
+  h+='</div>';
+  if(!contenu && !(compte && compte.expire)) h+='<div class="cg-local"><button class="cg-lien" type="button" data-act="local">Continuer sans compte</button><p class="cg-note">Sans compte, les données restent uniquement sur cet appareil.</p></div>';
+  if(compte && compte.expire && !contenu) h+='<div class="cg-local"><button class="cg-lien" type="button" data-act="fermerGate">Plus tard</button><p class="cg-note">Vos saisies restent sur cet appareil et seront envoyées après la reconnexion.</p></div>';
+  gate.innerHTML=h+'</div>';
+  var f=gate.querySelector('input:not([value]), input[value=""]')||gate.querySelector('input'); if(f) setTimeout(function(){ try{ f.focus(); }catch(e){} }, 50);
+}
+function err(t){ var e=$('cgErr'); if(e) e.textContent=t||''; }
+function occupe(b, on, txt){ if(!b) return; if(on){ b.dataset.t=b.textContent; b.disabled=true; b.textContent=txt||'…'; } else { b.disabled=false; if(b.dataset.t) b.textContent=b.dataset.t; } }
+function clicGate(e){
+  var t=e.target.closest('[data-tab],[data-act],[data-voir]'); if(!t) return;
+  if(t.hasAttribute('data-voir')){ var i=$(t.getAttribute('data-voir')); i.type=i.type==='password'?'text':'password'; t.textContent=i.type==='password'?'Afficher':'Masquer'; return; }
+  if(t.hasAttribute('data-tab')){ var em=$('cgEmail'); if(em) emailPre=em.value; onglet=t.getAttribute('data-tab'); rendreGate(); return; }
+  if(t.type==='submit') return;   // géré par submit
+  agir(t.getAttribute('data-act'), t);
+}
+async function agir(act, b){
+  if(act==='local'){ localStorage.setItem(K_LOCAL,'1'); fermerGate(); return; }
+  if(act==='fermerGate'){ fermerGate(); return; }
+  if(act==='recuOk'){ return etapeFerme(); }
+  if(act==='copierRecup'){ try{ await navigator.clipboard.writeText(b.getAttribute('data-code')); b.textContent='Copié ✓'; }catch(e){ b.textContent='Sélectionnez le code pour le copier'; } return; }
+  if(act==='creerFerme'){ var nom=$('cgFerme').value.trim(); if(!nom) return err('Donnez un nom à votre ferme.'); occupe(b,true,'Création…');
+    try{ var r=await api('/ferme/creer',{nom:nom}); compte.fermes=r.fermes; return choisirFerme(r.ferme); }catch(e){ occupe(b,false); return err(e.message); } }
+  if(act==='rejoindre'){ var cd=$('cgCode').value.trim(); if(cd.replace(/[^A-Za-z0-9]/g,'').length!==8) return err('Le code d\'invitation compte 8 caractères (ex. ABCD-EFGH).'); occupe(b,true,'Vérification…');
+    try{ var r2=await api('/ferme/rejoindre',{code:cd}); compte.fermes=r2.fermes; return choisirFerme(r2.ferme); }catch(e){ occupe(b,false); return err(e.message); } }
+  if(act==='ferme'){ var f=(compte.fermes||[]).filter(function(x){ return x.id===b.getAttribute('data-id'); })[0]; if(f) return choisirFerme(f); return; }
+  if(act==='importOui'||act==='importNon'){ return demarrerFerme(act==='importOui'); }
+  if(act==='autreFerme'){ return etapeFerme(true); }
+
+  var email=($('cgEmail')||{}).value||''; email=email.trim(); emailPre=email;
+  var mdp=($('cgMdp')||{}).value||'';
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return err('Adresse email invalide.');
+  if(mdp.length<8) return err('Le mot de passe doit faire au moins 8 caractères.');
+  if(act==='creer' && mdp!==$('cgMdp2').value) return err('Les deux mots de passe sont différents.');
+  if(navigator.onLine===false) return err('Pas de connexion internet : la première connexion demande du réseau.');
+  occupe(b,true, act==='creer'?'Création…':'Connexion…'); err('');
+  try{
+    var cle=await cleMdp(email, mdp), r3;
+    var ancien = compte && compte.user ? compte.user.email : null;
+    if(act==='creer') r3=await api('/compte/creer',{email:email, cle:cle}, true);
+    else if(act==='connexion') r3=await api('/compte/connexion',{email:email, cle:cle}, true);
+    else if(act==='recup') r3=await api('/compte/recuperer',{email:email, recup:$('cgRecup').value, nouvelleCle:cle}, true);
+    // Reconnexion du même compte après expiration : on garde tout ; sinon on repart propre
+    if(compte && compte.expire && ancien===r3.user.email){ compte.token=r3.token; compte.fermes=r3.fermes; delete compte.expire; sauverCompte(); fermerGate(); var bd=$('cmptBandeau'); if(bd) bd.remove(); planifier(0); T('Reconnecté'); return; }
+    if(compte && compte.expire && ancien!==r3.user.email){ effacerLocal(); }
+    compte={token:r3.token, user:r3.user, fermes:r3.fermes||[]}; sauverCompte();
+    localStorage.removeItem(K_LOCAL);
+    if(r3.recup) return afficherRecup(r3.recup, act==='recup');
+    etapeFerme();
+  }catch(e){ occupe(b,false); err(e.reseau?'Serveur injoignable : vérifiez la connexion internet.':e.message); }
+}
+function afficherRecup(code, apresRecup){
+  rendreGate('<h2 style="font-family:var(--font-d);color:var(--g-deep);font-size:1.2rem">'+(apresRecup?'Mot de passe changé':'Compte créé')+'</h2>'+
+    '<p class="cg-sub" style="margin-top:6px">Voici votre <b>code de récupération</b>. Notez-le sur papier ou en photo : il permet de retrouver le compte si vous oubliez le mot de passe. Il ne sera plus affiché.</p>'+
+    '<div class="cg-code" id="cgCodeR">'+esc(code)+'</div><button class="btn btn-secondary" type="button" data-act="copierRecup" data-code="'+esc(code)+'">Copier le code</button>'+
+    '<button class="btn btn-primary" type="button" data-act="recuOk" style="margin-top:10px">Je l\'ai noté, continuer</button>');
+}
+function etapeFerme(forcerChoix){
+  var fs=compte.fermes||[];
+  if(fs.length===1 && !forcerChoix) return choisirFerme(fs[0]);
+  var h='<h2 style="font-family:var(--font-d);color:var(--g-deep);font-size:1.2rem;margin-bottom:12px">'+(fs.length?'Quelle ferme ?':'Votre ferme')+'</h2>';
+  if(fs.length) h+='<div class="cg-choix" style="margin-bottom:16px">'+fs.map(function(f){ return '<button type="button" data-act="ferme" data-id="'+esc(f.id)+'"><b>'+esc(f.nom)+'</b><span>'+(f.role==='proprietaire'?'Propriétaire':'Membre')+' · '+f.membres+' personne(s)</span></button>'; }).join('')+'</div>';
+  h+='<form novalidate><div class="form-group"><label class="form-label" for="cgFerme">'+(fs.length?'Ou créer une nouvelle ferme':'Créer ma ferme')+'</label><input class="form-input" id="cgFerme" placeholder="Ex. GAEC des Trois Chênes" maxlength="80"></div><button class="btn btn-primary" type="submit" data-act="creerFerme">Créer la ferme</button></form>'+
+    '<form novalidate style="margin-top:18px"><div class="form-group"><label class="form-label" for="cgCode">Rejoindre la ferme d\'un associé, d\'un employeur ou d\'un client</label><input class="form-input" id="cgCode" placeholder="Code d\'invitation (ex. ABCD-EFGH)" autocapitalize="characters" spellcheck="false"></div><button class="btn btn-secondary" type="submit" data-act="rejoindre">Rejoindre</button></form>'+
+    '<p class="cg-err" id="cgErr" role="alert"></p>';
+  rendreGate(h);
+}
+var fermeChoisie=null;
+function choisirFerme(f){
+  fermeChoisie=f;
+  var loc=resumeLocal();
+  var dejaLiee = compte.fermeId===f.id && lire('ovi_sync_'+f.id,null);
+  if(loc.total>0 && !dejaLiee){
+    return rendreGate('<h2 style="font-family:var(--font-d);color:var(--g-deep);font-size:1.2rem">Données déjà sur cet appareil</h2>'+
+      '<p class="cg-sub" style="margin:8px 0 14px">Cet appareil contient '+loc.lots+' lot(s) et '+loc.autres+' autre(s) élément(s) saisis sans compte. Que voulez-vous en faire ?</p>'+
+      '<div class="cg-choix"><button type="button" data-act="importOui"><b>Les ajouter à « '+esc(f.nom)+' »</b><span>Ils seront disponibles sur tous vos appareils.</span></button>'+
+      '<button type="button" data-act="importNon"><b>Ne pas les ajouter</b><span>Ils sont effacés de cet appareil, la ferme n\'est pas modifiée.</span></button></div>');
+  }
+  demarrerFerme(false);
+}
+async function demarrerFerme(importer){
+  var f=fermeChoisie;
+  if(!importer) effacerLocal();
+  compte.fermeId=f.id; compte.fermeNom=f.nom; compte.role=f.role; sauverCompte();
+  sauverEtat({seq:0, recs:{}});
+  rendreGate('<p class="cg-sub" style="text-align:center;padding:24px 0">⏳ Récupération des données de « '+esc(f.nom)+' »…</p>');
+  try{ await chargerTout(); }catch(e){}
+  try{ sessionStorage.setItem('ovi_bienvenue', f.nom); }catch(e){}
+  location.reload();
+}
+// Premier chargement : envoie les données de l'appareil (si gardées) puis télécharge tout, sans passer par la mémoire de la page
+async function chargerTout(){
+  var etat={seq:0, recs:{}}, changes=[], now=Date.now();
+  var src={lots:lire('ovi_lots',[]), rappels:lire('ovi_rappels',[]), vaccins:lire('ovi_vaccins',[]), actesEco:lire('ovi_actes_eco',[]), stocks:lire('ovi_stocks',[]), stocksUses:lire('ovi_stocks_uses',[]), archives:lire('ovi_lots_archives',[])};
+  Object.keys(src).forEach(function(col){ src[col].forEach(function(r){ if(r && r.id!=null) changes.push({col:col, id:String(r.id), data:r, maj:now, base:0}); }); });
+  var p=lire('ovi_prix',null); if(p && Object.keys(p).some(function(k){ return k!=='produits' || Object.keys(p.produits||{}).length; })) changes.push({col:'reglages', id:'prix', data:{id:'prix', v:p}, maj:now, base:0});
+  var m=lire('ovi_meteo_lieu',null); if(m) changes.push({col:'reglages', id:'meteo', data:{id:'meteo', v:m}, maj:now, base:0});
+  var depuis=0, encore=true, tour=0, tout={};
+  while(encore && tour<20){
+    var r=await api('/sync',{fermeId:compte.fermeId, depuis:depuis, changes:tour===0?changes:[]});
+    (r.changes||[]).forEach(function(c){ tout[c.col+':'+c.id]=c; });
+    depuis=r.seq; encore=!!r.encore; tour++;
+  }
+  var cols={lots:[],rappels:[],vaccins:[],actesEco:[],stocks:[],stocksUses:[],archives:[]};
+  Object.keys(tout).forEach(function(k){ var c=tout[k]; if(c.suppr) return; etat.recs[k]={h:hash(JSON.stringify(c.data)), maj:c.maj};
+    if(cols[c.col]) cols[c.col].push(c.data);
+    else if(c.col==='reglages'){ if(c.id==='prix') ecrireBrut('ovi_prix', c.data.v||{}); if(c.id==='meteo' && c.data.v) ecrireBrut('ovi_meteo_lieu', c.data.v); } });
+  ecrireBrut('ovi_lots', cols.lots); ecrireBrut('ovi_rappels', cols.rappels); ecrireBrut('ovi_vaccins', cols.vaccins); ecrireBrut('ovi_actes_eco', cols.actesEco);
+  ecrireBrut('ovi_stocks', cols.stocks); ecrireBrut('ovi_stocks_uses', cols.stocksUses); ecrireBrut('ovi_lots_archives', cols.archives);
+  etat.seq=depuis; sauverEtat(etat);
+}
+
+// ---------------------------------------------------------------------
+// « Mon compte »
+// ---------------------------------------------------------------------
+function injecterCompte(){
+  if($('modalCompte')) return;
+  var st=document.createElement('style'); st.textContent=CSS; document.head.appendChild(st);
+  var m=document.createElement('div');
+  m.innerHTML='<div class="modal-overlay" id="modalCompte"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="cmptTitre"><div class="modal-header"><div class="modal-title" id="cmptTitre">Mon compte</div><button class="modal-close" type="button" onclick="closeModal(\'modalCompte\')" aria-label="Fermer">✕</button></div><div id="cmptContenu"></div></div></div>';
+  document.body.appendChild(m.firstChild);
+  $('modalCompte').addEventListener('click', function(e){ if(e.target===this){ this.classList.remove('open'); return; } var b=e.target.closest('[data-c]'); if(b) actionCompte(b.getAttribute('data-c'), b); });
+  var sec=$('navSecondary');
+  if(sec && !$('navCompte')){
+    var b=document.createElement('button'); b.className='nav-tab'; b.id='navCompte'; b.type='button';
+    b.innerHTML='<svg class="ico nav-icon" viewBox="0 0 24 24"><circle cx="12" cy="8.5" r="3.5"/><path d="M5 20c.9-3.6 3.7-5.5 7-5.5s6.1 1.9 7 5.5"/></svg><span class="nav-label">Mon compte</span><span class="cmpt-dot"></span>';
+    b.onclick=ouvrirCompte; sec.appendChild(b);
+  }
+}
+function ouvrirCompte(){ injecterCompte(); rendreCompte(); openModal('modalCompte'); if(connecte()) synchroniser(); }
+function statutHTML(){
+  var s=dernierStatut, cl='', t;
+  var att=connecte()?changementsLocaux(etatSync()).length:0;
+  if(navigator.onLine===false){ cl='attente'; t='Hors connexion'+(att?' · '+att+' modification(s) en attente, envoyées au retour du réseau':' · tout est à jour'); }
+  else if(s.etat==='envoi'){ cl='attente'; t='Synchronisation…'; }
+  else if(s.etat==='erreur'){ cl='erreur'; t='Échec de la synchronisation : '+esc(s.erreur); }
+  else if(att){ cl='attente'; t=att+' modification(s) en attente'; }
+  else t='Synchronisé'+(s.quand?' à '+s.quand.toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'}):'');
+  return '<div class="cmpt-st '+cl+'" id="cmptStatut"><i></i><span>'+t+'</span></div>';
+}
+function rendreCompte(){
+  var c=$('cmptContenu'); if(!c) return;
+  if(!connecte()){
+    c.innerHTML='<p>Vous utilisez OviAssist <b>sans compte</b> : vos données restent uniquement sur cet appareil.</p><p class="cg-note">Avec un compte, vous retrouvez vos lots sur tous vos appareils (téléphone, ordinateur) et pouvez partager votre ferme avec un associé ou un salarié.</p><button class="btn btn-primary btn-full" type="button" data-c="seConnecter" style="margin-top:12px">Créer un compte ou se connecter</button>';
+    return;
+  }
+  var f=(compte.fermes||[]).filter(function(x){ return x.id===compte.fermeId; })[0]||{nom:compte.fermeNom, role:compte.role};
+  var h='<div class="cmpt-ferme"><div class="text-muted" style="font-size:.75rem">Connecté</div><b>'+esc(compte.user.email)+'</b></div>'+
+    '<div class="cmpt-ferme"><div class="text-muted" style="font-size:.75rem">Ferme</div><b>'+esc(f.nom)+'</b> <span class="tag'+(f.role==='proprietaire'?' tag-green':'')+'" style="margin-left:6px">'+(f.role==='proprietaire'?'Propriétaire':'Membre')+'</span>'+statutHTML()+'<button class="btn btn-secondary btn-sm" type="button" data-c="sync" style="margin-top:8px">Synchroniser maintenant</button></div>';
+  h+='<div class="cmpt-sec"><h4>Personnes ayant accès à la ferme</h4><div id="cmptMembres"><p class="text-muted">Chargement…</p></div>'+
+    (f.role==='proprietaire'?'<button class="btn btn-secondary btn-sm" type="button" data-c="inviter" style="margin-top:8px">Inviter quelqu\'un</button><div id="cmptInvit"></div>':'<button class="btn btn-ghost btn-sm" type="button" data-c="quitter" style="margin-top:8px">Quitter cette ferme</button>')+'</div>';
+  h+='<div class="cmpt-sec"><h4>Autres fermes</h4>'+((compte.fermes||[]).length>1?'<button class="btn btn-secondary btn-sm" type="button" data-c="changer">Changer de ferme</button> ':'')+'<button class="btn btn-ghost btn-sm" type="button" data-c="changer">Créer ou rejoindre une ferme</button></div>';
+  h+='<div class="cmpt-sec"><h4>Sécurité</h4><details><summary class="cg-lien" style="padding:4px 0">Changer le mot de passe</summary>'+champMdp('cmA','Mot de passe actuel','current-password')+champMdp('cmN','Nouveau mot de passe (8 caractères minimum)','new-password')+
+    '<p class="cg-err" id="cmErr"></p><button class="btn btn-secondary btn-sm" type="button" data-c="mdp">Enregistrer</button></details>'+
+    '<button class="btn btn-danger btn-full" type="button" data-c="deconnexion" style="margin-top:14px">Se déconnecter</button><p class="cg-note">La déconnexion efface les données de cet appareil ; elles restent sur votre compte.</p></div>';
+  c.innerHTML=h;
+  c.querySelectorAll('[data-voir]').forEach(function(t){ t.onclick=function(){ var i=$(t.getAttribute('data-voir')); i.type=i.type==='password'?'text':'password'; t.textContent=i.type==='password'?'Afficher':'Masquer'; }; });
+  api('/ferme/membres',{fermeId:compte.fermeId}).then(function(r){
+    var el=$('cmptMembres'); if(!el) return;
+    el.innerHTML=r.membres.map(function(m){ return '<div class="cmpt-row"><span>'+esc(m.email)+(m.id===compte.user.id?' (vous)':'')+'</span><span>'+(m.role==='proprietaire'?'<span class="tag tag-green">Propriétaire</span>':(f.role==='proprietaire'?'<button class="btn btn-ghost btn-sm" type="button" data-c="retirer" data-id="'+esc(m.id)+'" data-email="'+esc(m.email)+'">Retirer</button>':'Membre'))+'</span></div>'; }).join('');
+  }).catch(function(e){ var el=$('cmptMembres'); if(el) el.innerHTML='<p class="text-muted">'+(e.reseau?'Liste disponible avec du réseau.':esc(e.message))+'</p>'; });
+}
+async function actionCompte(a, b){
+  if(a==='seConnecter'){ closeModal('modalCompte'); onglet='connexion'; ouvrirGate(); return; }
+  if(a==='sync'){ await synchroniser(); var s=$('cmptStatut'); if(s) s.outerHTML=statutHTML(); return; }
+  if(a==='inviter'){ occupe(b,true,'…'); try{ var r=await api('/ferme/inviter',{fermeId:compte.fermeId}); $('cmptInvit').innerHTML='<div class="cg-code" style="font-size:1.3rem">'+esc(r.code)+'</div><p class="cg-note" style="margin-top:0">À donner à la personne : elle crée son compte (ou se connecte), puis choisit « Rejoindre » et tape ce code. Valable 7 jours, pour une personne ou plusieurs.</p>'; }catch(e){ T(e.message); } occupe(b,false); return; }
+  if(a==='retirer'){ if(!confirm('Retirer '+b.getAttribute('data-email')+' de la ferme ? Cette personne n\'aura plus accès aux données.')) return; try{ await api('/ferme/retirer',{fermeId:compte.fermeId, userId:b.getAttribute('data-id')}); rendreCompte(); }catch(e){ T(e.message); } return; }
+  if(a==='quitter'){ if(!confirm('Quitter « '+compte.fermeNom+' » ? Ses données seront effacées de cet appareil et vous n\'y aurez plus accès.')) return; try{ var r2=await api('/ferme/retirer',{fermeId:compte.fermeId}); compte.fermes=r2.fermes||[]; delete compte.fermeId; sauverCompte(); effacerLocal(); location.reload(); }catch(e){ T(e.message); } return; }
+  if(a==='changer'){ if(navigator.onLine===false){ T('Changer de ferme demande du réseau'); return; } await synchroniser(); if(changementsLocaux(etatSync()).length && !confirm('Des modifications n\'ont pas encore été envoyées. Changer quand même de ferme ? Elles seraient perdues.')) return;
+    try{ var r3=await api('/compte/moi',{}); compte.fermes=r3.fermes; }catch(e){}
+    closeModal('modalCompte'); effacerLocal(); var fid=compte.fermeId; delete compte.fermeId; sauverCompte(); localStorage.removeItem('ovi_sync_'+fid); ouvrirGate(); etapeFerme(true); return; }
+  if(a==='mdp'){ var ae=$('cmA').value, ne=$('cmN').value, er=$('cmErr'); if(ne.length<8){ er.textContent='8 caractères minimum.'; return; } occupe(b,true,'…');
+    try{ await api('/compte/mdp',{ancienne:await cleMdp(compte.user.email, ae), nouvelle:await cleMdp(compte.user.email, ne)}); er.textContent=''; T('Mot de passe changé'); $('cmA').value=$('cmN').value=''; }catch(e){ er.textContent=e.message; } occupe(b,false); return; }
+  if(a==='deconnexion'){
+    await synchroniser();
+    var att=changementsLocaux(etatSync()).length;
+    if(att && !confirm(att+' modification(s) n\'ont pas pu être envoyées (pas de réseau ?). Si vous vous déconnectez maintenant, elles seront perdues. Continuer ?')) return;
+    if(!att && !confirm('Se déconnecter ? Les données seront effacées de cet appareil ; elles restent sur votre compte.')) return;
+    try{ if(window.OviPush && OviPush.desactiverSilencieux) await OviPush.desactiverSilencieux(); }catch(e){}
+    try{ await api('/compte/deconnexion',{}); }catch(e){}
+    effacerLocal(); compte=null; sauverCompte(); localStorage.removeItem(K_LOCAL);
+    location.reload();
+  }
+}
+function majStatut(){
+  var s=$('cmptStatut'); if(s) s.outerHTML=statutHTML();
+  var d=document.querySelector('#navCompte .cmpt-dot'); if(d) d.style.display=(dernierStatut.etat==='erreur'||(dernierStatut.attente>0&&navigator.onLine===false))?'block':'none';
+}
+function bandeauExpire(){
+  if($('cmptBandeau')) return;
+  var b=document.createElement('div'); b.className='cmpt-bandeau'; b.id='cmptBandeau'; b.setAttribute('role','status');
+  b.innerHTML='<span>Session expirée : reconnectez-vous pour synchroniser.</span><button class="btn btn-primary btn-sm" type="button">Se reconnecter</button>';
+  b.querySelector('button').onclick=function(){ emailPre=compte&&compte.user?compte.user.email:''; onglet='connexion'; ouvrirGate(); };
+  document.body.appendChild(b);
+}
+
+// ---------------------------------------------------------------------
+// Démarrage
+// ---------------------------------------------------------------------
+function demarrer(){
+  injecterCompte();
+  if(connecte()){
+    if(compte.expire) bandeauExpire();
+    try{ var bv=sessionStorage.getItem('ovi_bienvenue'); if(bv){ sessionStorage.removeItem('ovi_bienvenue'); T('Connecté à « '+bv+' »'); } }catch(e){}
+    planifier(800);
+    window.addEventListener('online', function(){ planifier(500); });
+    document.addEventListener('visibilitychange', function(){ if(document.visibilityState==='visible') planifier(300); });
+    setInterval(function(){ planifier(0); }, 60000);
+  } else if(compte && compte.token && !compte.fermeId){
+    ouvrirGate(); etapeFerme(true);
+  } else if(!modeLocal()){
+    ouvrirGate('connexion');
+  }
+}
+if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', demarrer); else demarrer();
+window.OviCompte = {synchroniser:synchroniser, statut:function(){ return dernierStatut; }, compte:function(){ return compte; }, ouvrir:ouvrirCompte, _changements:function(){ return connecte()?changementsLocaux(etatSync()):[]; }};
 })();
 
 </script>
