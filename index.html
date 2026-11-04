@@ -8996,7 +8996,9 @@ function afficherBandeau(){
   if(bandeau) return;
   bandeau = document.createElement('div');
   bandeau.className = 'maj-bandeau'; bandeau.setAttribute('role','status');
-  bandeau.innerHTML = '<div><b>Nouvelle version d\'OviAssist</b><span>Vos données sont conservées.</span></div>'+
+  var ml=document.getElementById('manifestLink'), lim=document.querySelector('.app-header .logo img');
+  var src=(ml && ml.getAttribute('href')==='manifest.webmanifest') ? 'icon-192.png' : (lim ? lim.src : 'icon-192.png');
+  bandeau.innerHTML = '<img class="maj-logo" src="'+src+'" alt="" width="40" height="40"><div><b>Nouvelle version d\'OviAssist</b><span>Vos données sont conservées.</span></div>'+
     '<button type="button" class="btn btn-primary btn-sm" id="majOk">Mettre à jour</button><button type="button" class="maj-plus-tard" id="majNon" aria-label="Plus tard">✕</button>';
   document.body.appendChild(bandeau);
   document.getElementById('majOk').onclick = function(){ this.disabled=true; this.textContent='Mise à jour…'; mettreAJour(); };
@@ -9061,7 +9063,7 @@ function afficherVersion(){
 var st = document.createElement('style');
 st.textContent = '.maj-bandeau{position:fixed;left:12px;right:12px;bottom:calc(var(--nav-h,64px) + var(--safe-bottom,0px) + 12px);z-index:900;display:flex;gap:12px;align-items:center;'+
   'background:var(--g-deep,#173F30);color:#fff;border-radius:12px;padding:12px 14px;box-shadow:0 12px 40px rgba(23,63,48,.3);max-width:520px;margin:0 auto}'+
-  '.maj-bandeau>div{flex:1;min-width:0}.maj-bandeau b{display:block;font-size:.9375rem}.maj-bandeau span{font-size:.8125rem;opacity:.85}'+
+  '.maj-logo{width:40px;height:40px;border-radius:10px;flex-shrink:0;box-shadow:0 0 0 1px rgba(255,255,255,.18)}.maj-bandeau>div{flex:1;min-width:0}.maj-bandeau b{display:block;font-size:.9375rem}.maj-bandeau span{font-size:.8125rem;opacity:.85}'+
   '.maj-bandeau .btn-primary{background:var(--straw,#E2C064);color:#1B2520;border-color:transparent;white-space:nowrap}'+
   '.maj-plus-tard{background:none;border:none;color:#fff;opacity:.7;font-size:1rem;cursor:pointer;min-width:32px;min-height:32px}'+
   '@media (min-width:960px){.maj-bandeau{bottom:20px;left:calc(var(--side-w,236px) + 20px)}}'+
@@ -9283,8 +9285,7 @@ function effacerLocal(){
 // Écran de connexion
 // ---------------------------------------------------------------------
 var CSS = '.cg{position:fixed;inset:0;z-index:2000;background:var(--surface,#F4F6F3);overflow-y:auto;display:flex;justify-content:center;padding:max(24px,env(safe-area-inset-top)) 16px 32px}'+
-'.cg-box{width:100%;max-width:420px;margin:auto 0}.cg-logo{display:flex;align-items:center;gap:12px;margin-bottom:18px}.cg-logo .ic{width:48px;height:48px;border-radius:12px;background:var(--g-deep,#173F30);color:#fff;display:flex;align-items:center;justify-content:center}'+
-'.cg-logo .ic svg{width:30px;height:30px;stroke:#fff}.cg h1{font-family:var(--font-d);font-size:1.5rem;color:var(--g-deep);line-height:1.1}.cg-sub{font-size:.875rem;color:var(--text-soft)}'+
+'.cg-box{width:100%;max-width:420px;margin:auto 0}.cg-logo{display:flex;justify-content:center;margin:4px 0 22px}.cg-logo img{width:132px;height:132px;border-radius:28px;display:block;box-shadow:0 10px 30px rgba(23,63,48,.22)}.cg-vh{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}.cg-sub{font-size:.875rem;color:var(--text-soft)}.cmpt-logo{width:30px;height:30px;border-radius:7px;flex-shrink:0;margin-right:2px}#modalCompte .modal-header{align-items:center}#modalCompte .modal-title{flex:1}'+
 '.cg-card{background:var(--white,#fff);border:1px solid var(--border-light);border-radius:var(--r,12px);padding:18px;box-shadow:var(--shadow)}'+
 '.cg-tabs{display:flex;gap:2px;padding:3px;background:var(--surface2);border-radius:10px;margin-bottom:16px}.cg-tabs button{flex:1;min-height:40px;border:none;background:none;border-radius:8px;font:500 .875rem var(--font-b);color:var(--text-soft);cursor:pointer}'+
 '.cg-tabs button.on{background:var(--white);color:var(--g-deep);box-shadow:var(--shadow)}.cg .btn{width:100%;margin-top:6px}.cg-err{color:#8A1A12;font-size:.8125rem;margin:6px 0 0;min-height:1em}'+
@@ -9299,7 +9300,12 @@ var CSS = '.cg{position:fixed;inset:0;z-index:2000;background:var(--surface,#F4F
 '.cmpt-bandeau{position:fixed;top:calc(var(--header-h,56px) + var(--safe-top,0px) + 8px);left:12px;right:12px;z-index:950;max-width:520px;margin:0 auto;background:var(--amber-pale);border:1px solid #F0CF9F;color:#5A3002;border-radius:10px;padding:10px 12px;display:flex;gap:10px;align-items:center;font-size:.875rem}'+
 '.cmpt-bandeau button{margin-left:auto}#navCompte .cmpt-dot{position:absolute;top:8px;right:22px;width:8px;height:8px;border-radius:50%;background:var(--amber);display:none}#navCompte{position:relative}';
 
-var ICO_MOUTON='<svg viewBox="0 0 24 24" fill="none" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M14.6 7.9a2.7 2.7 0 0 0-4.2-.8 2.7 2.7 0 0 0-4.6 1.6 2.4 2.4 0 0 0-1.8 3.9 2.4 2.4 0 0 0 2 3.9 2.5 2.5 0 0 0 4 .3 2.5 2.5 0 0 0 4.2-1.1"/><rect x="14.2" y="7.4" width="6.2" height="8" rx="3.1"/><path d="M14.5 9.4 12.9 10M20.1 9.4 21.7 10"/><path d="M7.6 17.4v2.6M12 17.4v2.6"/></svg>';
+// Logo officiel OviAssist : le fichier 512 px du site en ligne, sinon celui de l'en-tête de l'app
+function logoSrc(){
+  var ml=document.getElementById('manifestLink');
+  if(ml && ml.getAttribute('href')==='manifest.webmanifest') return 'icon-512.png';
+  var im=document.querySelector('.app-header .logo img'); return im ? im.src : 'icon-192.png';
+}
 var gate=null, onglet='connexion', emailPre='';
 function champMdp(id, lbl, auto){ return '<div class="form-group"><label class="form-label" for="'+id+'">'+lbl+'</label><div class="cg-oeil"><input class="form-input" type="password" id="'+id+'" autocomplete="'+auto+'" minlength="8"><button type="button" data-voir="'+id+'">Afficher</button></div></div>'; }
 function ouvrirGate(mode){
@@ -9310,7 +9316,7 @@ function ouvrirGate(mode){
 }
 function fermerGate(){ if(gate){ gate.remove(); gate=null; } document.documentElement.style.overflow=''; }
 function rendreGate(contenu){
-  var h='<div class="cg-box"><div class="cg-logo"><div class="ic">'+ICO_MOUTON+'</div><div><h1 id="cgTitre">OviAssist</h1><div class="cg-sub">Aide à la décision · parasitisme ovin</div></div></div><div class="cg-card">';
+  var h='<div class="cg-box"><div class="cg-logo"><img src="'+logoSrc()+'" alt="OviAssist, assistant sanitaire ovin" width="132" height="132"></div><h1 id="cgTitre" class="cg-vh">OviAssist</h1><div class="cg-card">';
   if(contenu){ h+=contenu; }
   else {
     h+='<div class="cg-tabs" role="tablist"><button type="button" role="tab" data-tab="connexion" class="'+(onglet==='connexion'?'on':'')+'">Se connecter</button><button type="button" role="tab" data-tab="creer" class="'+(onglet==='creer'?'on':'')+'">Créer un compte</button></div>';
@@ -9440,7 +9446,7 @@ function injecterCompte(){
   if($('modalCompte')) return;
   var st=document.createElement('style'); st.textContent=CSS; document.head.appendChild(st);
   var m=document.createElement('div');
-  m.innerHTML='<div class="modal-overlay" id="modalCompte"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="cmptTitre"><div class="modal-header"><div class="modal-title" id="cmptTitre">Mon compte</div><button class="modal-close" type="button" onclick="closeModal(\'modalCompte\')" aria-label="Fermer">✕</button></div><div id="cmptContenu"></div></div></div>';
+  m.innerHTML='<div class="modal-overlay" id="modalCompte"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="cmptTitre"><div class="modal-header"><img class="cmpt-logo" src="'+logoSrc()+'" alt=""><div class="modal-title" id="cmptTitre">Mon compte</div><button class="modal-close" type="button" onclick="closeModal(\'modalCompte\')" aria-label="Fermer">✕</button></div><div id="cmptContenu"></div></div></div>';
   document.body.appendChild(m.firstChild);
   $('modalCompte').addEventListener('click', function(e){ if(e.target===this){ this.classList.remove('open'); return; } var b=e.target.closest('[data-c]'); if(b) actionCompte(b.getAttribute('data-c'), b); });
   var sec=$('navSecondary');
